@@ -1,0 +1,164 @@
+name: Universal Android APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Nama proyek aplikasi'
+        required: false
+        default: 'app'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Extract & Normalize Source Payload
+        run: |
+          mkdir -p "$RUNNER_TEMP/work_src"
+          if [ -f "source_payload.zip" ]; then
+            unzip -q -o "source_payload.zip" -d "$RUNNER_TEMP/work_src"
+          else
+            echo "File source_payload.zip tidak ditemukan di repositori!"
+            exit 1
+          fi
+
+          cd "$RUNNER_TEMP/work_src"
+          rm -rf __MACOSX .DS_Store
+
+          while [ "$(find . -mindepth 1 -maxdepth 1 ! -name '.*' | wc -l)" -eq 1 ] && [ "$(find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l)" -eq 1 ]; do
+            SUBDIR="$(find . -mindepth 1 -maxdepth 1 -type d ! -name '.*')"
+            shopt -s dotglob nullglob
+            mv "$SUBDIR"/* .
+            rmdir "$SUBDIR"
+          done
+
+          echo "=== Struktur Root Proyek ==="
+          ls -la
+
+      - name: Build APK (Auto-Detect Gradle / Flutter / Capacitor / Web HTML)
+        run: |
+          cd "$RUNNER_TEMP/work_src"
+          mkdir -p "$RUNNER_TEMP/apk_out"
+
+          if [ -f "pubspec.yaml" ]; then
+            echo ">>> Mendeteksi Proyek Flutter <<<"
+            git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+            export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
+            flutter config --no-analytics
+            flutter pub get
+            if [ ! -d "android" ]; then
+              flutter create .
+            fi
+            flutter build apk --debug
+            find build/app/outputs -name "*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+
+          elif [ -f "package.json" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+            echo ">>> Mendeteksi Proyek Node / Web / Capacitor <<<"
+            npm install --legacy-peer-deps || true
+            if [ -f "ionic.config.json" ] || grep -q '"build"' package.json; then
+              npm run build || true
+            fi
+            if [ ! -d "android" ]; then
+              WEB_DIR="dist"
+              [ ! -d "$WEB_DIR" ] && [ -d "build" ] && WEB_DIR="build"
+              [ ! -d "$WEB_DIR" ] && [ -d "www" ] && WEB_DIR="www"
+              if [ ! -d "$WEB_DIR" ]; then
+                mkdir -p www_auto
+                find . -maxdepth 1 -type f \( -name "*.html" -o -name "*.js" -o -name "*.css" -o -name "*.png" -o -name "*.jpg" \) -exec cp {} www_auto/ \;
+                WEB_DIR="www_auto"
+              fi
+              npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
+              npx cap init "${{ github.event.inputs.project_name || 'App' }}" "com.builder.app" --web-dir "$WEB_DIR" || true
+              npx cap add android || true
+            fi
+            npx cap sync android || true
+            cd android
+            rm -f local.properties
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
+            chmod +x gradlew || true
+            sed -i 's/\r$//' gradlew 2>/dev/null || true
+            ./gradlew assembleDebug --no-daemon --stacktrace
+            find . -path "*/outputs/apk/*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+
+          elif [ -f "index.html" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ] && [ ! -d "app" ]; then
+            echo ">>> Mendeteksi Proyek HTML5 Murni -> Membungkus jadi WebView APK <<<"
+            mkdir -p www_app
+            find . -mindepth 1 -maxdepth 1 ! -name "www_app" -exec cp -r {} www_app/ \;
+            npm init -y
+            npm install @capacitor/core @capacitor/cli @capacitor/android
+            npx cap init "${{ github.event.inputs.project_name || 'WebApp' }}" "com.webview.autapk" --web-dir www_app
+            npx cap add android
+            npx cap copy android
+            cd android
+            rm -f local.properties
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+            find . -path "*/outputs/apk/*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+
+          else
+            echo ">>> Mendeteksi Proyek Android Gradle <<<"
+            if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ] && [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+              FOUND_GRADLE="$(find . -maxdepth 2 \( -name "settings.gradle*" -o -name "build.gradle*" \) | head -n 1)"
+              if [ -n "$FOUND_GRADLE" ]; then
+                cd "$(dirname "$FOUND_GRADLE")"
+              fi
+            fi
+
+            rm -f local.properties
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+            if [ -f "gradlew" ]; then
+              sed -i 's/\r$//' gradlew || true
+              chmod +x gradlew
+            fi
+
+            if [ -f "gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              gradle wrapper --gradle-version 8.7 || true
+              if [ -f "gradlew" ]; then
+                chmod +x gradlew
+                ./gradlew assembleDebug --no-daemon --stacktrace
+              else
+                gradle assembleDebug --no-daemon --stacktrace
+              fi
+            fi
+
+            find . -path "*/outputs/apk/*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+            if [ -z "$(ls -A "$RUNNER_TEMP/apk_out/")" ]; then
+              find . -name "*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+            fi
+          fi
+
+          ls -lh "$RUNNER_TEMP/apk_out/"
+          if [ -z "$(ls -A "$RUNNER_TEMP/apk_out/")" ]; then
+            echo "Gagal menemukan file APK hasil build!"
+            exit 1
+          fi
+
+      - name: Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-apk
+          path: ${{ runner.temp }}/apk_out/*.apk
+          if-no-files-found: error
+          retention-days: 7
