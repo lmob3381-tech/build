@@ -7,6 +7,10 @@ on:
         description: 'Nama proyek aplikasi'
         required: false
         default: 'app'
+      build_mode:
+        description: 'Mode build APK (debug atau release)'
+        required: false
+        default: 'debug'
 
 permissions:
   contents: write
@@ -68,9 +72,22 @@ jobs:
           ls -la
 
       - name: Build APK (Auto-Detect Gradle / Flutter / Capacitor / Web HTML)
+        env:
+          BUILD_MODE: ${{ github.event.inputs.build_mode || 'debug' }}
         run: |
           cd "$RUNNER_TEMP/work_src"
           mkdir -p "$RUNNER_TEMP/apk_out"
+
+          MODE_LOWER="$(echo "${BUILD_MODE:-debug}" | tr '[:upper:]' '[:lower:]')"
+          if [ "$MODE_LOWER" = "release" ]; then
+            GRADLE_TASK="assembleRelease"
+            FLUTTER_FLAG="--release"
+          else
+            MODE_LOWER="debug"
+            GRADLE_TASK="assembleDebug"
+            FLUTTER_FLAG="--debug"
+          fi
+          echo ">>> Mode Build APK: ${MODE_LOWER} (Task: ${GRADLE_TASK}) <<<"
 
           if [ -f "pubspec.yaml" ]; then
             echo ">>> Mendeteksi Proyek Flutter <<<"
@@ -81,7 +98,7 @@ jobs:
             if [ ! -d "android" ]; then
               flutter create .
             fi
-            flutter build apk --debug
+            flutter build apk $FLUTTER_FLAG
             find build/app/outputs -name "*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
 
           elif [ -f "package.json" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
@@ -109,7 +126,7 @@ jobs:
             echo "sdk.dir=$ANDROID_HOME" > local.properties
             chmod +x gradlew || true
             sed -i 's/\r$//' gradlew 2>/dev/null || true
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            ./gradlew $GRADLE_TASK --no-daemon --stacktrace
             find . -path "*/outputs/apk/*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
 
           elif [ -f "index.html" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ] && [ ! -d "app" ]; then
@@ -125,7 +142,7 @@ jobs:
             rm -f local.properties
             echo "sdk.dir=$ANDROID_HOME" > local.properties
             chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon
+            ./gradlew $GRADLE_TASK --no-daemon
             find . -path "*/outputs/apk/*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
 
           else
@@ -161,10 +178,10 @@ jobs:
 
             run_gradle_build() {
               if [ -f "gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-                ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
+                ./gradlew $GRADLE_TASK --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
                 return ${PIPESTATUS[0]}
               else
-                gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
+                gradle $GRADLE_TASK --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
                 return ${PIPESTATUS[0]}
               fi
             }
@@ -191,11 +208,49 @@ jobs:
             fi
           fi
 
-          ls -lh "$RUNNER_TEMP/apk_out/"
           if [ -z "$(ls -A "$RUNNER_TEMP/apk_out/")" ]; then
             echo "Gagal menemukan file APK hasil build!"
             exit 1
           fi
+
+          if [ "$MODE_LOWER" = "release" ]; then
+            echo ">>> Memeriksa & Menandatangani (Auto-Sign) APK Release <<<"
+            SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+            BT_DIR="$(ls -d "$SDK_DIR"/build-tools/* 2>/dev/null | sort -V | tail -n 1)"
+            ZIPALIGN_BIN="$BT_DIR/zipalign"
+            APKSIGNER_BIN="$BT_DIR/apksigner"
+            KEYSTORE_PATH="$RUNNER_TEMP/release_auto.jks"
+
+            if [ -x "$APKSIGNER_BIN" ]; then
+              for APK_FILE in "$RUNNER_TEMP/apk_out"/*.apk; do
+                [ -f "$APK_FILE" ] || continue
+                if "$APKSIGNER_BIN" verify "$APK_FILE" >/dev/null 2>&1; then
+                  echo "APK sudah tertanda tangan: $(basename "$APK_FILE")"
+                  continue
+                fi
+                if [ ! -f "$KEYSTORE_PATH" ]; then
+                  keytool -genkeypair -v -keystore "$KEYSTORE_PATH" -storepass android123 -keypass android123 -alias releasekey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Release, OU=Dev, O=AutoBuilder, L=ID, ST=ID, C=ID"
+                fi
+                BASE_NAME="$(basename "$APK_FILE" .apk)"
+                BASE_NAME="${BASE_NAME%-unsigned}"
+                ALIGNED_APK="$RUNNER_TEMP/${BASE_NAME}-aligned.apk"
+                SIGNED_APK="$RUNNER_TEMP/apk_out/${BASE_NAME}-signed.apk"
+                if [ -x "$ZIPALIGN_BIN" ]; then
+                  "$ZIPALIGN_BIN" -f -p 4 "$APK_FILE" "$ALIGNED_APK"
+                else
+                  cp "$APK_FILE" "$ALIGNED_APK"
+                fi
+                "$APKSIGNER_BIN" sign --ks "$KEYSTORE_PATH" --ks-key-alias releasekey --ks-pass pass:android123 --key-pass pass:android123 --out "$SIGNED_APK" "$ALIGNED_APK"
+                "$APKSIGNER_BIN" verify "$SIGNED_APK"
+                rm -f "$APK_FILE" "$ALIGNED_APK" "$RUNNER_TEMP/apk_out"/*.idsig
+                echo "APK Release berhasil di-sign: $(basename "$SIGNED_APK")"
+              done
+            else
+              echo "Peringatan: apksigner tidak ditemukan di $BT_DIR, melewati auto-sign."
+            fi
+          fi
+
+          ls -lh "$RUNNER_TEMP/apk_out/"
 
       - name: Upload Compiled APK Artifact
         uses: actions/upload-artifact@v5
