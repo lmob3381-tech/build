@@ -145,15 +145,43 @@ jobs:
               chmod +x gradlew
             fi
 
-            if [ -f "gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-              ./gradlew assembleDebug --no-daemon --stacktrace
-            else
-              gradle wrapper --gradle-version 8.7 || true
-              if [ -f "gradlew" ]; then
-                chmod +x gradlew
-                ./gradlew assembleDebug --no-daemon --stacktrace
+            TARGET_GRADLE="8.11.1"
+            if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+              PROP_VER="$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' gradle/wrapper/gradle-wrapper.properties | head -n 1 | sed 's/^gradle-//')"
+              if [ -n "$PROP_VER" ]; then
+                TARGET_GRADLE="$PROP_VER"
+              fi
+            fi
+
+            if [ ! -f "gradlew" ] || [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+              echo ">>> Menyiapkan Gradle Wrapper versi $TARGET_GRADLE <<<"
+              gradle wrapper --gradle-version "$TARGET_GRADLE" || gradle wrapper --gradle-version 8.11.1 || true
+              [ -f "gradlew" ] && chmod +x gradlew
+            fi
+
+            run_gradle_build() {
+              if [ -f "gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+                ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
+                return ${PIPESTATUS[0]}
               else
-                gradle assembleDebug --no-daemon --stacktrace
+                gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle_build.log"
+                return ${PIPESTATUS[0]}
+              fi
+            }
+
+            if ! run_gradle_build; then
+              REQ_VER="$(grep -oE 'Minimum supported Gradle version is [0-9]+\.[0-9]+(\.[0-9]+)?' "$RUNNER_TEMP/gradle_build.log" | tail -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?')"
+              if [ -n "$REQ_VER" ]; then
+                echo ">>> AGP meminta Gradle minimal versi $REQ_VER — otomatis upgrade wrapper & retry! <<<"
+                if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+                  sed -i -E "s|gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-(all|bin)\.zip|gradle-${REQ_VER}-bin.zip|g" gradle/wrapper/gradle-wrapper.properties
+                else
+                  gradle wrapper --gradle-version "$REQ_VER" || true
+                fi
+                [ -f "gradlew" ] && chmod +x gradlew
+                run_gradle_build
+              else
+                exit 1
               fi
             fi
 
