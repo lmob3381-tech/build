@@ -94,12 +94,19 @@ jobs:
             git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
             export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
             flutter config --no-analytics
-            flutter pub get
-            if [ ! -d "android" ]; then
-              flutter create .
+            if [ ! -d "android" ] || [ ! -f "android/gradlew" ]; then
+              flutter create --platforms=android .
             fi
-            flutter build apk $FLUTTER_FLAG
-            find build/app/outputs -name "*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+            if [ -f "scripts/configure_android.py" ]; then
+              python3 scripts/configure_android.py
+            fi
+            flutter pub get
+            flutter build apk $FLUTTER_FLAG --target-platform android-arm,android-arm64
+            if [ -f "build/app/outputs/flutter-apk/app-${MODE_LOWER}.apk" ]; then
+              cp "build/app/outputs/flutter-apk/app-${MODE_LOWER}.apk" "$RUNNER_TEMP/apk_out/"
+            else
+              find build/app/outputs/flutter-apk -name "*.apk" -exec cp {} "$RUNNER_TEMP/apk_out/" \;
+            fi
 
           elif [ -f "package.json" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
             echo ">>> Mendeteksi Proyek Node / Web / Capacitor <<<"
